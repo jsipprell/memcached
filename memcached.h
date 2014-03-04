@@ -307,6 +307,8 @@ struct settings {
     bool slab_reassign;     /* Whether or not slab reassignment is allowed */
     int slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
+
+    unsigned int idle_timeout; /* Disconnect after this many idle seconds */
 };
 
 extern struct stats stats;
@@ -445,6 +447,11 @@ struct conn {
         size_t size;
         size_t offset;
     } stats;
+
+    /* timeout extension */
+    unsigned int timeout;
+    unsigned int *timeout_pending;
+    struct event timeout_event;
 
     /* Binary protocol stuff */
     /* This is where the binary header goes */

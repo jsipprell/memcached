@@ -54,6 +54,11 @@
 #endif
 #endif
 
+#define IS_CONNECTED_STATE(st) ((st) > conn_listening && \
+                                (st) < conn_max_state && \
+                                (st) != conn_closing)
+#define IS_CONNECTED(c)       (!IS_UDP((c)->transport) && IS_CONNECTED_STATE((c)->state))
+
 /*
  * forward declarations
  */
@@ -96,6 +101,9 @@ static int add_msghdr(conn *c);
 
 
 static void conn_free(conn *c);
+
+/* timeout event handler */
+static void timeout_event_handler(const int fd, const short which, void *arg);
 
 /** exported globals **/
 struct stats stats;
@@ -225,6 +233,11 @@ static void settings_init(void) {
     settings.hashpower_init = 0;
     settings.slab_reassign = false;
     settings.slab_automove = 0;
+#ifdef DEFAULT_IDLE_TIMEOUT
+    settings.idle_timeout = DEFAULT_IDLE_TIMEOUT;
+#else
+    settings.idle_timeout = 0;
+#endif
 }
 
 /*
@@ -368,6 +381,9 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->msglist = 0;
         c->hdrbuf = 0;
 
+        c->timeout = 0;
+        c->timeout_pending = NULL;
+
         c->rsize = read_buffer_size;
         c->wsize = DATA_BUFFER_SIZE;
         c->isize = ITEM_LIST_INITIAL;
@@ -397,6 +413,9 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
     c->transport = transport;
     c->protocol = settings.binding_protocol;
+
+    c->timeout = settings.idle_timeout;
+    c->timeout_pending = NULL;
 
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
@@ -461,6 +480,23 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         return NULL;
     }
 
+    if (IS_CONNECTED(c) && c->timeout > 0 && !c->timeout_pending) {
+        struct timeval t = { 0, 0};
+        t.tv_sec = c->timeout;
+        c->timeout_pending = &c->timeout;
+        evtimer_set(&c->timeout_event, timeout_event_handler, c);
+        event_base_set(base, &c->timeout_event);
+
+        if(evtimer_add(&c->timeout_event,&t) == -1) {
+            c->timeout_pending = NULL;
+            event_del(&c->event);
+            if (conn_add_to_freelist(c)) {
+                conn_free(c);
+            }
+            perror("evtimer_add");
+            return NULL;
+        }
+    }
     STATS_LOCK();
     stats.curr_conns++;
     stats.total_conns++;
@@ -473,6 +509,11 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 
 static void conn_cleanup(conn *c) {
     assert(c != NULL);
+
+    if (c->timeout_pending) {
+        c->timeout_pending = NULL;
+        evtimer_del(&c->timeout_event);
+    }
 
     if (c->item) {
         item_remove(c->item);
@@ -534,6 +575,10 @@ void conn_free(conn *c) {
 static void conn_close(conn *c) {
     assert(c != NULL);
 
+    if (c->timeout_pending) {
+        c->timeout_pending = NULL;
+        event_del(&c->timeout_event);
+    }
     /* delete the event, the socket and the conn */
     event_del(&c->event);
 
@@ -3623,14 +3668,43 @@ static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
     struct event_base *base = c->event.ev_base;
+    if (IS_CONNECTED(c) && c->timeout > 0 && (!c->timeout_pending ||
+                                             *(c->timeout_pending) == 0)) {
+        struct timeval t = { 0, 0 };
+        t.tv_sec = c->timeout;
+        c->timeout_pending = &c->timeout;
+        evtimer_set(&c->timeout_event, timeout_event_handler, c);
+        event_base_set(base, &c->timeout_event);
+
+        if(evtimer_add(&c->timeout_event,&t) == -1) {
+            c->timeout_pending = NULL;
+            perror("evtimer_add");
+            event_del(&c->event);
+            return false;
+        }
+    } else if(c->timeout_pending) {
+        c->timeout_pending = NULL;
+        evtimer_del(&c->timeout_event);
+    }
     if (c->ev_flags == new_flags)
         return true;
-    if (event_del(&c->event) == -1) return false;
+    if (event_del(&c->event) == -1)
+        goto update_event_failure;
     event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = new_flags;
-    if (event_add(&c->event, 0) == -1) return false;
+    if (event_add(&c->event, 0) == -1)
+        goto update_event_failure;
+
     return true;
+
+update_event_failure:
+  if (c->timeout_pending) {
+    c->timeout_pending = NULL;
+    evtimer_del(&c->timeout_event);
+  }
+  return false;
+
 }
 
 /*
@@ -4046,6 +4120,24 @@ static void drive_machine(conn *c) {
     return;
 }
 
+static void timeout_event_handler(const int fd, const short which, void *arg)
+{
+    static unsigned int marker = 0;
+    conn *c = (conn*)arg;
+    assert(c != NULL);
+
+    if (c->timeout_pending && *(c->timeout_pending) > 0) {
+        c->timeout_pending = &marker;
+        if (IS_CONNECTED(c)) {
+            conn_set_state(c, conn_closing);
+            drive_machine(c);
+        } else {
+            c->timeout_pending = NULL;
+            evtimer_del(&c->timeout_event);
+        }
+    }
+}
+
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
 
@@ -4062,8 +4154,13 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
-    drive_machine(c);
+    /* reset timer if present */
+    if (c->timeout_pending && *(c->timeout_pending) > 0) {
+        c->timeout_pending = NULL;
+        evtimer_del(&c->timeout_event);
+    }
 
+    drive_machine(c);
     /* wait for next event */
     return;
 }
@@ -4483,6 +4580,7 @@ static void usage(void) {
            "              is turned on automatically; if not, then it may be turned on\n"
            "              by sending the \"stats detail on\" command to the server.\n");
     printf("-t <num>      number of threads to use (default: 4)\n");
+    printf("-T <seconds>  disconnect idle sessions after <seconds> (default: none)\n");
     printf("-R            Maximum number of requests per event, limits the number of\n"
            "              requests process for a given connection to prevent \n"
            "              starvation (default: 20)\n");
@@ -4774,6 +4872,7 @@ int main (int argc, char **argv) {
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
           "o:"  /* Extended generic options */
+          "T:"  /* Idle timeout */
         ))) {
         switch (c) {
         case 'a':
@@ -4876,6 +4975,13 @@ int main (int argc, char **argv) {
                                 "threads is not recommended.\n"
                                 " Set this value to the number of cores in"
                                 " your machine or less.\n");
+            }
+            break;
+        case 'T':
+            settings.idle_timeout = atoi(optarg);
+            if (settings.idle_timeout < 0) {
+                fprintf(stderr, "Idle timeout must be greater than 0\n");
+                return 1;
             }
             break;
         case 'D':
@@ -5244,3 +5350,5 @@ int main (int argc, char **argv) {
 
     return retval;
 }
+
+/* vi: set sts=4 sw=4 ai et tw=0: */
