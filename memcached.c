@@ -54,10 +54,12 @@
 #endif
 #endif
 
+#ifdef ENABLE_IDLE_TIMEOUTS
 #define IS_CONNECTED_STATE(st) ((st) > conn_listening && \
                                 (st) < conn_max_state && \
                                 (st) != conn_closing)
 #define IS_CONNECTED(c)       (!IS_UDP((c)->transport) && IS_CONNECTED_STATE((c)->state))
+#endif
 
 /*
  * forward declarations
@@ -102,8 +104,10 @@ static int add_msghdr(conn *c);
 
 static void conn_free(conn *c);
 
+#ifdef ENABLE_IDLE_TIMEOUTS
 /* timeout event handler */
 static void timeout_event_handler(const int fd, const short which, void *arg);
+#endif
 
 /** exported globals **/
 struct stats stats;
@@ -233,11 +237,14 @@ static void settings_init(void) {
     settings.hashpower_init = 0;
     settings.slab_reassign = false;
     settings.slab_automove = 0;
-#ifdef DEFAULT_IDLE_TIMEOUT
-    settings.idle_timeout = DEFAULT_IDLE_TIMEOUT;
+
+#ifdef ENABLE_IDLE_TIMEOUTS
+#if IDLE_TIMEOUT_DEFAULT
+    settings.idle_timeout = IDLE_TIMEOUT_DEFAULT;
 #else
     settings.idle_timeout = 0;
 #endif
+#endif /* ENABLE_IDLE_TIMEOUTS */
 }
 
 /*
@@ -381,8 +388,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         c->msglist = 0;
         c->hdrbuf = 0;
 
+#ifdef ENABLE_IDLE_TIMEOUTS
         c->timeout = 0;
         c->timeout_pending = NULL;
+#endif
 
         c->rsize = read_buffer_size;
         c->wsize = DATA_BUFFER_SIZE;
@@ -414,8 +423,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
     c->transport = transport;
     c->protocol = settings.binding_protocol;
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     c->timeout = settings.idle_timeout;
     c->timeout_pending = NULL;
+#endif
 
     /* unix socket mode doesn't need this, so zeroed out.  but why
      * is this done for every command?  presumably for UDP
@@ -480,6 +491,7 @@ conn *conn_new(const int sfd, enum conn_states init_state,
         return NULL;
     }
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     if (IS_CONNECTED(c) && c->timeout > 0 && !c->timeout_pending) {
         struct timeval t = { 0, 0};
         t.tv_sec = c->timeout;
@@ -497,6 +509,8 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             return NULL;
         }
     }
+#endif /* ENABLE_IDLE_TIMEOUTS */
+
     STATS_LOCK();
     stats.curr_conns++;
     stats.total_conns++;
@@ -510,10 +524,12 @@ conn *conn_new(const int sfd, enum conn_states init_state,
 static void conn_cleanup(conn *c) {
     assert(c != NULL);
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     if (c->timeout_pending) {
         c->timeout_pending = NULL;
         evtimer_del(&c->timeout_event);
     }
+#endif /* ENABLE_IDLE_TIMEOUTS */
 
     if (c->item) {
         item_remove(c->item);
@@ -575,10 +591,13 @@ void conn_free(conn *c) {
 static void conn_close(conn *c) {
     assert(c != NULL);
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     if (c->timeout_pending) {
         c->timeout_pending = NULL;
         event_del(&c->timeout_event);
     }
+#endif
+
     /* delete the event, the socket and the conn */
     event_del(&c->event);
 
@@ -3668,6 +3687,8 @@ static bool update_event(conn *c, const int new_flags) {
     assert(c != NULL);
 
     struct event_base *base = c->event.ev_base;
+
+#ifdef ENABLE_IDLE_TIMEOUTS
     if (IS_CONNECTED(c) && c->timeout > 0 && (!c->timeout_pending ||
                                              *(c->timeout_pending) == 0)) {
         struct timeval t = { 0, 0 };
@@ -3686,25 +3707,25 @@ static bool update_event(conn *c, const int new_flags) {
         c->timeout_pending = NULL;
         evtimer_del(&c->timeout_event);
     }
+#endif /* ENABLE_IDLE_TIMEOUTS */
+
     if (c->ev_flags == new_flags)
         return true;
-    if (event_del(&c->event) == -1)
-        goto update_event_failure;
+    if (event_del(&c->event) == -1) goto update_event_failure;
     event_set(&c->event, c->sfd, new_flags, event_handler, (void *)c);
     event_base_set(base, &c->event);
     c->ev_flags = new_flags;
-    if (event_add(&c->event, 0) == -1)
-        goto update_event_failure;
-
+    if (event_add(&c->event, 0) == -1) goto update_event_failure;
     return true;
 
 update_event_failure:
-  if (c->timeout_pending) {
-    c->timeout_pending = NULL;
-    evtimer_del(&c->timeout_event);
-  }
-  return false;
-
+#ifdef ENABLE_IDLE_TIMEOUTS
+    if (c->timeout_pending) {
+        c->timeout_pending = NULL;
+        evtimer_del(&c->timeout_event);
+    }
+#endif /* ENABLE_IDLE_TIMEOUTS */
+    return false;
 }
 
 /*
@@ -4120,6 +4141,7 @@ static void drive_machine(conn *c) {
     return;
 }
 
+#ifdef ENABLE_IDLE_TIMEOUTS
 static void timeout_event_handler(const int fd, const short which, void *arg)
 {
     static unsigned int marker = 0;
@@ -4137,6 +4159,7 @@ static void timeout_event_handler(const int fd, const short which, void *arg)
         }
     }
 }
+#endif /* ENABLE_IDLE_TIMEOUTS */
 
 void event_handler(const int fd, const short which, void *arg) {
     conn *c;
@@ -4154,11 +4177,13 @@ void event_handler(const int fd, const short which, void *arg) {
         return;
     }
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     /* reset timer if present */
     if (c->timeout_pending && *(c->timeout_pending) > 0) {
         c->timeout_pending = NULL;
         evtimer_del(&c->timeout_event);
     }
+#endif /* ENABLE_IDLE_TIMEOUTS */
 
     drive_machine(c);
     /* wait for next event */
@@ -4542,6 +4567,9 @@ static void usage(void) {
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
+#ifdef ENABLE_IDLE_TIMEOUTS
+           "-T <seconds>  disconnect idle sessions after <seconds> (default: 0, 0 is none)\n"
+#endif
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
            "-l <addr>     interface to listen on (default: INADDR_ANY, all addresses)\n"
            "              <addr> may be specified as host:port. If you don't specify\n"
@@ -4580,7 +4608,6 @@ static void usage(void) {
            "              is turned on automatically; if not, then it may be turned on\n"
            "              by sending the \"stats detail on\" command to the server.\n");
     printf("-t <num>      number of threads to use (default: 4)\n");
-    printf("-T <seconds>  disconnect idle sessions after <seconds> (default: none)\n");
     printf("-R            Maximum number of requests per event, limits the number of\n"
            "              requests process for a given connection to prevent \n"
            "              starvation (default: 20)\n");
@@ -4872,7 +4899,9 @@ int main (int argc, char **argv) {
           "I:"  /* Max item size */
           "S"   /* Sasl ON */
           "o:"  /* Extended generic options */
+#ifdef ENABLE_IDLE_TIMEOUTS
           "T:"  /* Idle timeout */
+#endif
         ))) {
         switch (c) {
         case 'a':
@@ -4975,13 +5004,6 @@ int main (int argc, char **argv) {
                                 "threads is not recommended.\n"
                                 " Set this value to the number of cores in"
                                 " your machine or less.\n");
-            }
-            break;
-        case 'T':
-            settings.idle_timeout = atoi(optarg);
-            if (settings.idle_timeout < 0) {
-                fprintf(stderr, "Idle timeout must be greater than 0\n");
-                return 1;
             }
             break;
         case 'D':
@@ -5105,6 +5127,15 @@ int main (int argc, char **argv) {
 
             }
             break;
+#ifdef ENABLE_IDLE_TIMEOUTS
+        case 'T':
+            settings.idle_timeout = atoi(optarg);
+            if (settings.idle_timeout < 0) {
+                fprintf(stderr, "Idle timeout must be greater than or equal to 0\n");
+                return 1;
+            }
+            break;
+#endif /* ENABLE_IDLE_TIMEOUTS */
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;

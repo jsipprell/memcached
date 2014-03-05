@@ -308,7 +308,9 @@ struct settings {
     int slab_automove;     /* Whether or not to automatically move slabs */
     int hashpower_init;     /* Starting hash power level */
 
+#ifdef ENABLE_IDLE_TIMEOUTS
     unsigned int idle_timeout; /* Disconnect after this many idle seconds */
+#endif
 };
 
 extern struct stats stats;
