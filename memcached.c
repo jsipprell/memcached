@@ -3729,8 +3729,8 @@ static bool update_timeout_event(conn *c, int remove, struct event_base *base) {
         }
 
         if (settings.verbose > 1 && c->timeout_pending)
-            fprintf(stderr,"fd %d: (re-)set timeout to %u seconds.\n",
-                    c->sfd,*(c->timeout_pending));
+            fprintf(stderr,"fd %d: (re-)set timeout to %u seconds in state %s.\n",
+                    c->sfd,*(c->timeout_pending),state_text(c->state));
     }
 
     return true;
@@ -4187,28 +4187,29 @@ static void timeout_event_handler(const int fd, const short which, void *arg)
 {
     static unsigned int marker = 0;
     conn *c = (conn*)arg;
+    unsigned int *timeout_pending;
+
     assert(c != NULL);
+    timeout_pending  = c->timeout_pending;
+    c->timeout_pending = NULL;
 
     if (settings.verbose > 1)
         fprintf(stderr,"fd %d: idle timeout event, state %s, timeout %d seconds.\n",
-                c->sfd,state_text(c->state),(c->timeout_pending ? (int)*(c->timeout_pending) : -1));
-    if (c->timeout_pending && *(c->timeout_pending) > 0) {
+                c->sfd,state_text(c->state),(timeout_pending ? (int)*timeout_pending: -1));
+    if (timeout_pending && *timeout_pending > 0) {
         if (IS_CONNECTED(c)) {
             if (settings.verbose > 0)
                 fprintf(stderr,"fd %d: idle disconnect (%u seconds)\n",
-                        c->sfd,*(c->timeout_pending));
+                        c->sfd,*timeout_pending);
             c->timeout_pending = &marker;
             STATS_LOCK();
             stats.idle_disc_conns++;
             STATS_UNLOCK();
             conn_set_state(c, conn_closing);
             drive_machine(c);
-        } else {
-            if (settings.verbose > 0)
-                fprintf(stderr,"fd %d: ignoring unexpected idle timeout (%u seconds) while in state %s.\n",
-                        c->sfd,*(c->timeout_pending),state_text(c->state));
-           update_timeout_event(c,1,NULL);
-        }
+        } else if (settings.verbose > 0)
+            fprintf(stderr,"fd %d: ignoring unexpected idle timeout (%u seconds) while in state %s.\n",
+                    c->sfd,*timeout_pending,state_text(c->state));
     }
 }
 #endif /* ENABLE_IDLE_TIMEOUTS */
