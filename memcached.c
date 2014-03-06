@@ -4602,9 +4602,6 @@ static void usage(void) {
     printf("-p <num>      TCP port number to listen on (default: 11211)\n"
            "-U <num>      UDP port number to listen on (default: 11211, 0 is off)\n"
            "-s <file>     UNIX socket path to listen on (disables network support)\n"
-#ifdef ENABLE_IDLE_TIMEOUTS
-           "-T <seconds>  disconnect idle sessions after <seconds> (default: 0, 0 is none)\n"
-#endif
            "-a <mask>     access mask for UNIX socket, in octal (default: 0700)\n"
            "-l <addr>     interface to listen on (default: INADDR_ANY, all addresses)\n"
            "              <addr> may be specified as host:port. If you don't specify\n"
@@ -4651,6 +4648,9 @@ static void usage(void) {
     printf("-B            Binding protocol - one of ascii, binary, or auto (default)\n");
     printf("-I            Override the size of each slab page. Adjusts max item size\n"
            "              (default: 1mb, min: 1k, max: 128m)\n");
+#ifdef ENABLE_IDLE_TIMEOUTS
+    printf("-T <seconds>  disconnect idle sessions after <seconds> (0 to disable [default])\n");
+#endif
 #ifdef ENABLE_SASL
     printf("-S            Turn on Sasl authentication\n");
 #endif
