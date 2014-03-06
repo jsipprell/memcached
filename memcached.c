@@ -718,6 +718,41 @@ static void conn_set_state(conn *c, enum conn_states state) {
             MEMCACHED_PROCESS_COMMAND_END(c->sfd, c->wbuf, c->wbytes);
         }
         c->state = state;
+#ifdef ENABLE_IDLE_TIMEOUTS
+        /* Make sure a timeout is set for stream connections that we
+         * are switching into an active i/o state for. update_event()
+         * may not have picked this up if the previous state was
+         * non-applicable.
+         */
+        if (!IS_UDP(c->transport) && c->timeout > 0 && !(c->timeout_pending)) {
+
+            struct timeval t = { 0, 0};
+
+            switch(state) {
+            case conn_read:
+            case conn_write:
+            case conn_nread:
+            case conn_swallow:
+            case conn_mwrite:
+                t.tv_sec = c->timeout;
+                c->timeout_pending = &c->timeout;
+                evtimer_set(&c->timeout_event, timeout_event_handler, c);
+                event_base_set(c->event.ev_base, &c->timeout_event);
+                if (evtimer_add(&c->timeout_event, &t) == -1) {
+                    c->timeout_pending = NULL;
+                    perror("evtimer_add");
+                }
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    if (c->state == conn_listening && c->timeout_pending != NULL) {
+        c->timeout_pending = NULL;
+        evtimer_del(&c->timeout_event);
+#endif /* ENABLE_IDLE_TIMEOUTS */
     }
 }
 
@@ -3689,7 +3724,7 @@ static bool update_event(conn *c, const int new_flags) {
     struct event_base *base = c->event.ev_base;
 
 #ifdef ENABLE_IDLE_TIMEOUTS
-    if (IS_CONNECTED(c) && c->timeout > 0 && (!c->timeout_pending ||
+    if (IS_CONNECTED(c) && c->timeout > 0 && (!(c->timeout_pending) ||
                                              *(c->timeout_pending) == 0)) {
         struct timeval t = { 0, 0 };
         t.tv_sec = c->timeout;
