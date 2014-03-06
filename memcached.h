@@ -250,6 +250,9 @@ struct stats {
     unsigned int  curr_conns;
     unsigned int  total_conns;
     uint64_t      rejected_conns;
+#ifdef ENABLE_IDLE_TIMEOUTS
+    uint64_t      idle_disc_conns;
+#endif
     unsigned int  reserved_fds;
     unsigned int  conn_structs;
     uint64_t      get_cmds;

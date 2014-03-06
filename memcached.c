@@ -188,6 +188,9 @@ static void stats_init(void) {
     stats.slabs_moved = 0;
     stats.accepting_conns = true; /* assuming we start in this state. */
     stats.slab_reassign_running = false;
+#ifdef ENABLE_IDLE_TIMEOUTS
+    stats.idle_disc_conns = 0;
+#endif
 
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
@@ -201,6 +204,9 @@ static void stats_reset(void) {
     STATS_LOCK();
     stats.total_items = stats.total_conns = 0;
     stats.rejected_conns = 0;
+#ifdef ENABLE_IDLE_TIMEOUTS
+    stats.idle_disc_conns = 0;
+#endif
     stats.evictions = 0;
     stats.reclaimed = 0;
     stats.listen_disabled_num = 0;
@@ -2653,6 +2659,11 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     if (settings.maxconns_fast) {
         APPEND_STAT("rejected_connections", "%llu", (unsigned long long)stats.rejected_conns);
     }
+#ifdef ENABLE_IDLE_TIMEOUTS
+    if (settings.idle_timeout > 0) {
+        APPEND_STAT("idle_disconnected_connections", "%llu", (unsigned long long)stats.idle_disc_conns);
+    }
+#endif /* ENABLE_IDLE_TIMEOUTS */
     APPEND_STAT("connection_structures", "%u", stats.conn_structs);
     APPEND_STAT("reserved_fds", "%u", stats.reserved_fds);
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
@@ -4186,6 +4197,9 @@ static void timeout_event_handler(const int fd, const short which, void *arg)
     if (c->timeout_pending && *(c->timeout_pending) > 0) {
         c->timeout_pending = &marker;
         if (IS_CONNECTED(c)) {
+            STATS_LOCK();
+            stats.idle_disc_conns++;
+            STATS_UNLOCK();
             conn_set_state(c, conn_closing);
             drive_machine(c);
         } else {
