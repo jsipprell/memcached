@@ -48,6 +48,10 @@
 #include <sysexits.h>
 #include <stddef.h>
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+#include "timeout.h"
+#endif
+
 /* FreeBSD 4.x doesn't have IOV_MAX exposed. */
 #ifndef IOV_MAX
 #if defined(__FreeBSD__) || defined(__APPLE__)
@@ -239,6 +243,14 @@ static void settings_init(void) {
     settings.shutdown_command = false;
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
+#ifdef ENABLE_IDLE_TIMEOUTS
+    settings.timeout_thread_sleep = 10 * 1000000;
+#if IDLE_TIMEOUT_DEFAULT
+    settings.idle_timeout = IDLE_TIMEOUT_DEFAULT;
+#else
+    settings.idle_timeout = 0;
+#endif
+#endif /* ENABLE_IDLE_TIMEOUTS */
 }
 
 /*
@@ -323,6 +335,11 @@ static void conn_init(void) {
         /* This is unrecoverable so bail out early. */
         exit(1);
     }
+
+#ifdef ENABLE_IDLE_TIMEOUTS
+    if (settings.idle_timeout)
+        timeout_thread_init(max_fds,NULL);
+#endif
 }
 
 static const char *prot_text(enum protocol prot) {
@@ -582,6 +599,14 @@ static void conn_close(conn *c) {
     return;
 }
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+void conn_timeout(conn *c, struct timeval *tv)
+{
+    conn_close(c);
+    /* TODO: adjust statistics to account for idle out */
+}
+#endif /* ENABLE_IDLE_TIMEOUTS */
+
 /*
  * Shrinks a connection's buffers if they're too big.  This prevents
  * periodic large "get" requests from permanently chewing lots of server
@@ -681,6 +706,11 @@ static void conn_set_state(conn *c, enum conn_states state) {
     }
 }
 
+void conn_timeout(conn *c, struct timeval *tv)
+{
+    conn_set_state(c, conn_closing);
+    drive_machine(c);
+}
 /*
  * Ensures that there is room for another struct iovec in a connection's
  * iov list.
@@ -4807,6 +4837,11 @@ static void usage(void) {
            "              - lru_crawler_tocrawl: Max items to crawl per slab per run\n"
            "                default is 0 (unlimited)\n"
            );
+#ifdef  ENABLE_IDLE_TIMEOUT
+    printf("              - timeout_thread_sleep: Microseconds to sleep between idle timeout scans.\n"
+           "                default is 100000000 (10 seconds)\n");
+    printf("-T <seconds>  Disconnect idle sessions after <seconds> (0 to disable [default])\n");
+#endif /* !ENABLE_IDLE_TIMEOUT */
     return;
 }
 
@@ -5387,6 +5422,15 @@ int main (int argc, char **argv) {
 
             }
             break;
+#ifdef ENABLE_IDLE_TIMEOUTS
+        case 'T':
+            settings.idle_timeout = atoi(optarg);
+            if (settings.idle_timeout < 0) {
+                fprintf(stderr, "Idle timeout must be greater than or equal to 0\n");
+                return 1;
+            }
+            break;
+#endif /* ENABLE_IDLE_TIMEOUTS */
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;

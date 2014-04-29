@@ -33,6 +33,10 @@ if ENABLE_SASL
 memcached_SOURCES += sasl_defs.c
 endif
 
+if BUILD_TIMEOUT
+memcached_SOURCES += timeout.c timeout.h
+endif
+
 memcached_debug_SOURCES = $(memcached_SOURCES)
 memcached_CPPFLAGS = -DNDEBUG
 memcached_debug_LDADD = @PROFILER_LDFLAGS@

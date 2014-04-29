@@ -281,6 +281,9 @@ struct stats {
     bool          slab_reassign_running; /* slab reassign in progress */
     uint64_t      slabs_moved;       /* times slabs were moved around */
     bool          lru_crawler_running; /* crawl in progress */
+#ifdef ENABLE_IDLE_TIMEOUTS
+    uint64_t      idle_disc_conns;
+#endif
 };
 
 #define MAX_VERBOSITY_LEVEL 2
@@ -324,6 +327,10 @@ struct settings {
     char *hash_algorithm;     /* Hash algorithm in use */
     int lru_crawler_sleep;  /* Microsecond sleep between items */
     uint32_t lru_crawler_tocrawl; /* Number of items to crawl per run */
+#ifdef ENABLE_IDLE_TIMEOUTS
+    unsigned int idle_timeout; /* Disconnect after this many idle seconds */
+    int timeout_thread_sleep;  /* Microsecond sleep between idle thread runs */
+#endif
 };
 
 extern struct stats stats;
@@ -407,7 +414,7 @@ struct conn {
     bool authenticated;
     enum conn_states  state;
     enum bin_substates substate;
-    rel_time_t last_cmd_time;
+    volatile rel_time_t last_cmd_time;
     struct event event;
     short  ev_flags;
     short  which;   /** which events were just triggered */

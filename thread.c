@@ -15,6 +15,10 @@
 #include <atomic.h>
 #endif
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+#include "timeout.h"
+#endif
+
 #define ITEMS_PER_ALLOC 64
 
 /* An item in the connection queue. */
@@ -382,6 +386,10 @@ static void *worker_libevent(void *arg) {
 
     register_thread_initialized();
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+     timeout_thread_init(-1,me);
+#endif /* ENABLE_IDLE_TIMEOUTS */
+
     event_base_loop(me->base, 0);
     return NULL;
 }
@@ -401,9 +409,13 @@ static void thread_libevent_process(int fd, short which, void *arg) {
             fprintf(stderr, "Can't read from libevent pipe\n");
 
     switch (buf[0]) {
+#ifdef ENABLE_IDLE_TIMEOUTS
+    case 'T':
+    timeout_check_idle(me);
+        break;
+#endif /* ENABLE_IDLE_TIMEOUTS */
     case 'c':
     item = cq_pop(me->new_conn_queue);
-
     if (NULL != item) {
         conn *c = conn_new(item->sfd, item->init_state, item->event_flags,
                            item->read_buffer_size, item->transport, me->base);
