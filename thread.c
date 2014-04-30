@@ -387,7 +387,8 @@ static void *worker_libevent(void *arg) {
     register_thread_initialized();
 
 #ifdef ENABLE_IDLE_TIMEOUTS
-     timeout_thread_init(-1,me);
+    if(settings.idle_timeout)
+        mc_timeout_init(-1,me);
 #endif /* ENABLE_IDLE_TIMEOUTS */
 
     event_base_loop(me->base, 0);
@@ -411,7 +412,7 @@ static void thread_libevent_process(int fd, short which, void *arg) {
     switch (buf[0]) {
 #ifdef ENABLE_IDLE_TIMEOUTS
     case 'T':
-    timeout_check_idle(me);
+    mc_timeout_check_idle(me);
         break;
 #endif /* ENABLE_IDLE_TIMEOUTS */
     case 'c':

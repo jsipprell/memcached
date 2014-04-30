@@ -244,12 +244,12 @@ static void settings_init(void) {
     settings.tail_repair_time = TAIL_REPAIR_TIME_DEFAULT;
     settings.flush_enabled = true;
 #ifdef ENABLE_IDLE_TIMEOUTS
-    settings.timeout_thread_sleep = 10 * 1000000;
 #if IDLE_TIMEOUT_DEFAULT
     settings.idle_timeout = IDLE_TIMEOUT_DEFAULT;
 #else
     settings.idle_timeout = 0;
 #endif
+    settings.timeout_thread_sleep = settings.idle_timeout * 1000000;
 #endif /* ENABLE_IDLE_TIMEOUTS */
 }
 
@@ -338,7 +338,7 @@ static void conn_init(void) {
 
 #ifdef ENABLE_IDLE_TIMEOUTS
     if (settings.idle_timeout)
-        timeout_thread_init(max_fds,NULL);
+        mc_timeout_init(max_fds,NULL);
 #endif
 }
 
@@ -706,11 +706,6 @@ static void conn_set_state(conn *c, enum conn_states state) {
     }
 }
 
-void conn_timeout(conn *c, struct timeval *tv)
-{
-    conn_set_state(c, conn_closing);
-    drive_machine(c);
-}
 /*
  * Ensures that there is room for another struct iovec in a connection's
  * iov list.
@@ -4837,11 +4832,13 @@ static void usage(void) {
            "              - lru_crawler_tocrawl: Max items to crawl per slab per run\n"
            "                default is 0 (unlimited)\n"
            );
-#ifdef  ENABLE_IDLE_TIMEOUT
-    printf("              - timeout_thread_sleep: Microseconds to sleep between idle timeout scans.\n"
-           "                default is 100000000 (10 seconds)\n");
-    printf("-T <seconds>  Disconnect idle sessions after <seconds> (0 to disable [default])\n");
-#endif /* !ENABLE_IDLE_TIMEOUT */
+#ifdef  ENABLE_IDLE_TIMEOUTS
+    printf("              Idle timeout options:\n");
+    printf("              - idle_timeout: Number of seconds that an connection can be idle before\n"
+           "                is is disconnected by the idle timeout thread (0 to disable [default])\n"
+           "              - timeout_thread_sleep: Microseconds to sleep between idle timeout scans.\n"
+           "                default is the idle_timeout option in usec.\n");
+#endif /* !ENABLE_IDLE_TIMEOUTS */
     return;
 }
 
@@ -5084,6 +5081,10 @@ int main (int argc, char **argv) {
         LRU_CRAWLER,
         LRU_CRAWLER_SLEEP,
         LRU_CRAWLER_TOCRAWL
+#ifdef ENABLE_IDLE_TIMEOUTS
+        ,TIMEOUT_THREAD_SLEEP
+        ,IDLE_TIMEOUT
+#endif
     };
     char *const subopts_tokens[] = {
         [MAXCONNS_FAST] = "maxconns_fast",
@@ -5095,6 +5096,10 @@ int main (int argc, char **argv) {
         [LRU_CRAWLER] = "lru_crawler",
         [LRU_CRAWLER_SLEEP] = "lru_crawler_sleep",
         [LRU_CRAWLER_TOCRAWL] = "lru_crawler_tocrawl",
+#ifdef ENABLE_IDLE_TIMEOUTS
+        [TIMEOUT_THREAD_SLEEP] = "timeout_thread_sleep",
+        [IDLE_TIMEOUT] = "idle_timeout",
+#endif
         NULL
     };
 
@@ -5415,6 +5420,30 @@ int main (int argc, char **argv) {
                 }
                 settings.lru_crawler_tocrawl = tocrawl;
                 break;
+#ifdef ENABLE_IDLE_TIMEOUTS
+            case TIMEOUT_THREAD_SLEEP:
+                settings.timeout_thread_sleep = (subopts_value ? atoi(subopts_value) : -1);
+                if (settings.timeout_thread_sleep < 250000) {
+                    fprintf(stderr,"timeout_thread_sleep must be greater than 250ms\n");
+                    return 1;
+                }
+                break;
+            case IDLE_TIMEOUT:
+                if(!subopts_value) {
+                  fprintf(stderr, "Idle timeout option requires a value.\n");
+                  return 1;
+                } else {
+                    int timeout = atoi(subopts_value);
+                    if (timeout < 0) {
+                        fprintf(stderr, "Idle timeout must be greater than or equal to 0\n");
+                        return 1;
+                    }
+                    settings.idle_timeout = timeout;
+                    if(settings.timeout_thread_sleep == 0)
+                      settings.timeout_thread_sleep = timeout * 1000000;
+                } while(0);
+                break;
+#endif /* ENABLE_IDLE_TIMEOUTS */
             default:
                 printf("Illegal suboption \"%s\"\n", subopts_value);
                 return 1;
@@ -5422,15 +5451,6 @@ int main (int argc, char **argv) {
 
             }
             break;
-#ifdef ENABLE_IDLE_TIMEOUTS
-        case 'T':
-            settings.idle_timeout = atoi(optarg);
-            if (settings.idle_timeout < 0) {
-                fprintf(stderr, "Idle timeout must be greater than or equal to 0\n");
-                return 1;
-            }
-            break;
-#endif /* ENABLE_IDLE_TIMEOUTS */
         default:
             fprintf(stderr, "Illegal argument \"%c\"\n", c);
             return 1;
