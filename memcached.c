@@ -188,6 +188,9 @@ static void stats_init(void) {
     stats.slab_reassign_running = false;
     stats.lru_crawler_running = false;
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+    stats.idle_disc_conns = 0;
+#endif
     /* make the time we started always be 2 seconds before we really
        did, so time(0) - time.started is never zero.  if so, things
        like 'settings.oldest_live' which act as booleans as well as
@@ -456,6 +459,10 @@ conn *conn_new(const int sfd, enum conn_states init_state,
             assert(false);
         }
     }
+
+#ifdef ENABLE_IDLE_TIMEOUTS
+    c->last_cmd_time = current_time;
+#endif
 
     c->state = init_state;
     c->rlbytes = 0;
@@ -2607,6 +2614,11 @@ static void server_stats(ADD_STAT add_stats, conn *c) {
     if (settings.maxconns_fast) {
         APPEND_STAT("rejected_connections", "%llu", (unsigned long long)stats.rejected_conns);
     }
+#ifdef ENABLE_IDLE_TIMEOUTS
+    if (settings.idle_timeout > 0) {
+        APPEND_STAT("idle_disconnected_connections", "%llu", (unsigned long long)stats.idle_disc_conns);
+    }
+#endif /* ENABLE_IDLE_TIMEOUTS */
     APPEND_STAT("connection_structures", "%u", stats.conn_structs);
     APPEND_STAT("reserved_fds", "%u", stats.reserved_fds);
     APPEND_STAT("cmd_get", "%llu", (unsigned long long)thread_stats.get_cmds);
@@ -2654,6 +2666,10 @@ static void process_stat_settings(ADD_STAT add_stats, void *c) {
     assert(add_stats);
     APPEND_STAT("maxbytes", "%llu", (unsigned long long)settings.maxbytes);
     APPEND_STAT("maxconns", "%d", settings.maxconns);
+#ifdef ENABLE_IDLE_TIMEOUTS
+    APPEND_STAT("idle_timeout", "%u", settings.idle_timeout);
+    APPEND_STAT("timeout_thread_sleep", "%d", settings.timeout_thread_sleep);
+#endif /* ENABLE_IDLE_TIMEOUTS */
     APPEND_STAT("tcpport", "%d", settings.port);
     APPEND_STAT("udpport", "%d", settings.udpport);
     APPEND_STAT("inter", "%s", settings.inter ? settings.inter : "NULL");
