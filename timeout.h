@@ -18,7 +18,7 @@ extern void mc_timeout_clear(conn*);
 extern void mc_timeout_init(int max_conns, LIBEVENT_THREAD *id);
 
 /* from memcached.c */
-extern void conn_timeout(conn*, struct timeval*);
+extern void conn_timeout(conn*, struct timeval *timeout, uint64_t elapsed);
 
 /* Instead of sys/queue.h, we have .... */
 #if NEED_LL_DECL == 1
@@ -36,7 +36,7 @@ typedef struct type
 
 #define LL_INIT(head) ((head)->first = NULL)
 #define LL_EMPTY(head) ((head) == NULL || (head)->first == NULL)
-#define LL_FIRST(head) ((head) ? &((head)->first) : NULL)
+#define LL_FIRST(head) (&((head)->first))
 #define LL_NEXT(ep) (*(ep) ? &((*(ep))->next) : NULL)
 #define LL_INSERT(head,e) do { \
     if((e) != NULL) (e)->next = (head)->first; \

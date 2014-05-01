@@ -252,7 +252,7 @@ static void settings_init(void) {
 #else
     settings.idle_timeout = 0;
 #endif
-    settings.timeout_thread_sleep = settings.idle_timeout * 1000000;
+    settings.timeout_thread_sleep = -1;
 #endif /* ENABLE_IDLE_TIMEOUTS */
 }
 
@@ -607,10 +607,12 @@ static void conn_close(conn *c) {
 }
 
 #ifdef ENABLE_IDLE_TIMEOUTS
-void conn_timeout(conn *c, struct timeval *tv)
+void conn_timeout(conn *c, struct timeval *timeout, uint64_t elapsed)
 {
     conn_close(c);
-    /* TODO: adjust statistics to account for idle out */
+    STATS_LOCK();
+    stats.idle_disc_conns++;
+    STATS_UNLOCK();
 }
 #endif /* ENABLE_IDLE_TIMEOUTS */
 
@@ -5455,7 +5457,7 @@ int main (int argc, char **argv) {
                         return 1;
                     }
                     settings.idle_timeout = timeout;
-                    if(settings.timeout_thread_sleep == 0)
+                    if(settings.timeout_thread_sleep <= 0)
                       settings.timeout_thread_sleep = timeout * 1000000;
                 } while(0);
                 break;
@@ -5594,6 +5596,10 @@ int main (int argc, char **argv) {
 #endif
     }
 
+#ifdef ENABLE_IDLE_TIMEOUTS
+    if (settings.timeout_thread_sleep <= 0 && settings.idle_timeout > 0)
+        settings.timeout_thread_sleep = settings.idle_timeout * 1000000;
+#endif
     /* initialize main thread libevent instance */
     main_base = event_init();
 

@@ -156,7 +156,6 @@ fi
 AM_CONDITIONAL([BUILD_DTRACE],[test "$build_dtrace" = "yes"])
 AM_CONDITIONAL([DTRACE_INSTRUMENT_OBJ],[test "$dtrace_instrument_obj" = "yes"])
 AM_CONDITIONAL([ENABLE_SASL],[test "$enable_sasl" = "yes"])
-AM_CONDITIONAL([BUILD_TIMEOUT],[test "$enable_idle_timeouts" = "yes"])
 
 AC_SUBST(DTRACE)
 AC_SUBST(DTRACEFLAGS)
@@ -555,11 +554,30 @@ AC_ARG_ENABLE(docs,
   [AS_HELP_STRING([--disable-docs],[Disable documentation generation])])
 
 AC_ARG_ENABLE(idle-timeouts,
-  [AS_HELP_STRING([--enable-idle-timeouts],[Enable per-connection idle timeouts (requires threading)])])
+  [AS_HELP_STRING([--enable-idle-timeouts@<:@=SECS@:>@],
+  [Enable per-connection idle timeouts with optional SECS idle timeout  (default is off)])],
+  [],[enable_idle_timeouts=no])
 
-AS_IF([test "x$enable_idle_timeouts" = "xyes"],
+AS_CASE($enable_idle_timeouts,
+  [no],[enable_idle_timeouts_default=],
+  [yes],[enable_idle_timeouts_default=],
+  [enable_idle_timeouts_default="$enable_idle_timeouts"
+   enable_idle_timeouts=yes
+   AS_IF([test 0"$enable_idle_timeouts_default" -gt 0 2>&1],[],
+      [AC_MSG_ERROR([--enable-idle-timeouts can only be set to 'yes', 'no' or a number greater than 0.])])
+])
+
+AS_VAR_IF([enable_idle_timeouts],[yes],
   [AC_DEFINE([ENABLE_IDLE_TIMEOUTS], 1,
-    [Set to nonzero if you want per-connection idle timeouts (not intended for extremely high connecton count usage)])])
+      [Set to nonzero if you want per-connection idle timeouts (not intended for extremely high connecton count usage)])
+])
+
+AS_VAR_IF([enable_idle_timeouts_default],[],[],
+  [AC_DEFINE_UNQUOTED([IDLE_TIMEOUT_DEFAULT], [$enable_idle_timeouts_default],
+      [Set to the number of seconds that idle timeout disconnects should default to or undef for no default (requires ENABLE_IDLE_TIMEOUTS)])
+])
+
+AM_CONDITIONAL([BUILD_TIMEOUT],[test x"$enable_idle_timeouts" = x"yes"])
 
 AC_PATH_PROG([XML2RFC], [xml2rfc], "no")
 AC_PATH_PROG([XSLTPROC], [xsltproc], "no")

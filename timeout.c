@@ -33,14 +33,17 @@
 #endif
 #include "timeout.h"
 
+typedef uint64_t usec_t;
+#define USEC_T(us) ((usec_t)(us))
 #define THREAD_EQL(t1,t2) ( ((t1) && (t2) && pthread_equal((t1)->thread_id,(t2)->thread_id)) \
                              || ((t1) == NULL && (t2) == NULL) )
-#define SEC_TO_USEC(s) ((uint64_t)(s) * (uint64_t)1000000)
-#define USEC_TO_SEC(us) ((uint64_t)(us) / (uint64_t)1000000)
-
-#define TV_TO_USEC(tv) (SEC_TO_USEC((tv)->tv_sec) + (tv)->tv_usec % (uint64_t)1000000)
+#define SEC_TO_USEC(s) (USEC_T(s) * USEC_T(1000000))
+#define SEC_TO_MSEC(s) (USEC_T(s) * USEC_T(1000))
+#define USEC_TO_SEC(us) (USEC_T(us) / USEC_T(1000000))
+#define USEC_TO_MSEC(us) ((USEC_T(us) % USEC_T(1000000)) / USEC_T(1000))
+#define TV_TO_USEC(tv) (SEC_TO_USEC((tv)->tv_sec) + (tv)->tv_usec % USEC_T(1000000))
 #define USEC_TO_TV(tv,us) do { (tv)->tv_sec = USEC_TO_SEC(us); \
-                               (tv)->tv_usec = (uint64_t)(us) % (uint64_t)1000000; \
+                               (tv)->tv_usec = USEC_T(us) % USEC_T(1000000); \
                              } while(0)
 #define STATE_CAN_TIMEOUT(s) ((s) > conn_listening && \
                               (s) != conn_closing && \
@@ -128,6 +131,7 @@ mc_timeout_free_no_mutex(timeout_event_t *t)
 }
 #define TIMEOUT_FREE_UNSAFE mc_timeout_free_no_mutex
 
+#ifndef NDEBUG
 static void
 dump_list(const char *name, struct timeout_event_list *list)
 {
@@ -136,15 +140,6 @@ dump_list(const char *name, struct timeout_event_list *list)
     ANN(pthread_mutex_lock(&timeout_mutex));
     LL_FOREACH(list,tp) count++;
     ANN(pthread_mutex_unlock(&timeout_mutex));
-}
-
-#if 0
-static void
-mc_timeout_free(timeout_event_t **tp)
-{
-    mutex_lock(&timeout_mutex);
-    mc_timeout_free_no_mutex(tp);
-    mutex_unlock(&timeout_mutex);
 }
 #endif
 
@@ -190,8 +185,9 @@ mc_timeout_add(conn *c, const struct timeval *tv, short flags,
                 list_name = "timeouts";
             else if(list == &freelist)
                 list_name = "freelist";
-            fprintf(stderr,"Added new timeout at %llu ms to %s list.\n",
-                        TV_TO_USEC(&t->tv) / 1000, list_name);
+            fprintf(stderr,"%d: added new timeout at %llu ms to %s list.\n",
+                t->fd,(unsigned long long)(TV_TO_USEC(&t->tv) / USEC_T(1000)),
+                                                                    list_name);
         }
     }
     ANN(pthread_mutex_unlock(&timeout_mutex));
@@ -202,33 +198,35 @@ mc_timeout_add(conn *c, const struct timeval *tv, short flags,
 void mc_timeout_check_idle(LIBEVENT_THREAD *me)
 {
     timeout_event_t *t, **tp;
-    uint64_t now = SEC_TO_USEC(current_time);
+    usec_t now = SEC_TO_USEC(current_time);
 
     if(settings.verbose > 2)
-        fprintf(stderr,"checkout idle timeout for a thread (current_time = %u)\n",
-                            (unsigned)current_time);
+        fprintf(stderr,"idle timeout connection scan, clock:%llu\n",
+                        (unsigned long long)SEC_TO_MSEC(current_time));
     ANN(pthread_mutex_lock(&timeout_mutex));
     LL_FOREACH_E(&pending,tp,t) {
         if (t->fd > -1 && conns[t->fd] && THREAD_EQL(conns[t->fd]->thread,me)) {
             /* Make sure we are still talking about the same connection and
              * that it has really timed out.
              */
-            if(t->c == conns[t->fd] && CONN_CAN_TIMEOUT(t->c)) {
-                uint64_t elapsed = now - SEC_TO_USEC(t->c->last_cmd_time);
+            if(t->c == conns[t->fd] && t->c->sfd == t->fd && CONN_CAN_TIMEOUT(t->c)) {
+                usec_t elapsed = now - SEC_TO_USEC(t->c->last_cmd_time);
                 if(elapsed >= TV_TO_USEC(&t->tv)) {
-                    uint64_t otv = TV_TO_USEC(&t->tv);
                     event_del(&t->ev);
                     LL_REMOVE(tp);
-                    USEC_TO_TV(&t->tv,elapsed);
-                    conn_timeout(t->c,&t->tv); /* memcached.c */
-                    if (t->type == timeout_type_custom) {
-                        USEC_TO_TV(&t->tv,otv);
+                    if(settings.verbose)
+                        fprintf(stderr,"%d: idle disconnect (%llu.%llu seconds)\n",t->fd,
+                            (unsigned long long)USEC_TO_SEC(elapsed),
+                            (unsigned long long)USEC_TO_MSEC(elapsed));
+                    conn_timeout(t->c,&t->tv,elapsed); /* memcached.c */
+                    if (t->type == timeout_type_custom)
                         event_add(&t->ev,&t->tv);
-                    } else
+                    else
                         TIMEOUT_FREE_UNSAFE(t);
                 } else if(t->type == timeout_type_default) {
                     if(settings.verbose)
-                        fprintf(stderr,"Destroying pending timeout as it seems to have reset\n");
+                        fprintf(stderr,"%d: destroying pending timeout as it "
+                                            "seems to have reset\n",t->fd);
                     TIMEOUT_DESTROY_UNSAFE(tp);
                 }
             } else
@@ -272,11 +270,11 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
     timeout_event_t *t = (timeout_event_t*)arg;
     timeout_event_t *cause = NULL;
     char buf[1] = {'T'};
-    uint64_t next_sleep = (uint64_t)settings.timeout_thread_sleep;
-    uint64_t idle_timeout = SEC_TO_USEC(settings.idle_timeout);
-    uint64_t now = SEC_TO_USEC(current_time);
+    usec_t next_sleep = (usec_t)settings.timeout_thread_sleep;
+    usec_t idle_timeout = SEC_TO_USEC(settings.idle_timeout);
+    usec_t now = SEC_TO_USEC(current_time);
     struct timeval tv;
-    uint64_t elapsed;
+    usec_t elapsed;
     int i;
     LIBEVENT_THREAD *wake_thread = NULL;
 
@@ -286,7 +284,8 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
 
     ANN(pthread_mutex_lock(&timeout_mutex));
     if(settings.verbose > 1)
-        fprintf(stderr,"\ntimeout_event_handler thread start, now = %llu\n",USEC_TO_SEC(now));
+        fprintf(stderr,"\ntimeout_event_handler thread start, now = %llu\n",
+                                        (unsigned long long)USEC_TO_SEC(now));
 
     if(!LL_EMPTY(&timeouts)) {
         timeout_event_t *ti, **tp;
@@ -342,7 +341,6 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
         conn *c = conns[i];
         if(!c || !CONN_CAN_TIMEOUT(c) || !c->thread)
             continue;
-        printf("last_cmd_time=%llu\n",SEC_TO_USEC(c->last_cmd_time));
         if((elapsed = now - SEC_TO_USEC(c->last_cmd_time)) >= idle_timeout) {
             if (!wake_thread || THREAD_EQL(wake_thread,c->thread)) {
                 USEC_TO_TV(&tv,elapsed);
@@ -369,7 +367,7 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
             next_sleep = idle_timeout - elapsed;
     }
 
-    if(freelist_len >= MAX_FREE_TIMEOUTS) {
+    if (freelist_len >= MAX_FREE_TIMEOUTS) {
         timeout_event_t **tp;
         ANN(pthread_mutex_lock(&timeout_mutex));
         for(tp = LL_FIRST(&freelist); *tp != NULL && freelist_len > MAX_FREE_TIMEOUTS / 2;
@@ -383,6 +381,7 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
         event_del(&t->ev);
     }
 
+#ifndef NDEBUG
     if(settings.verbose > 2) {
         static int counter = 0;
 
@@ -393,11 +392,13 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
         }
         counter++;
     }
+#endif
+
     USEC_TO_TV(&t->tv,next_sleep);
     event_add(&t->ev,(next_sleep > 0 ? &t->tv : NULL));
     if(settings.verbose > 2)
         fprintf(stderr,"timeout_event_handler thread run complete, sleeping for %llu ms\n\n",
-                next_sleep/1000);
+                                            (unsigned long long)USEC_TO_MSEC(next_sleep));
 
 }
 
