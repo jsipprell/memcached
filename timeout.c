@@ -40,7 +40,7 @@ typedef uint64_t usec_t;
 #define SEC_TO_USEC(s) (USEC_T(s) * USEC_T(1000000))
 #define SEC_TO_MSEC(s) (USEC_T(s) * USEC_T(1000))
 #define USEC_TO_SEC(us) (USEC_T(us) / USEC_T(1000000))
-#define USEC_TO_MSEC(us) ((USEC_T(us) % USEC_T(1000000)) / USEC_T(1000))
+#define USEC_TO_MSEC(us) (USEC_T(us) / USEC_T(1000))
 #define TV_TO_USEC(tv) (SEC_TO_USEC((tv)->tv_sec) + (tv)->tv_usec % USEC_T(1000000))
 #define USEC_TO_TV(tv,us) do { (tv)->tv_sec = USEC_TO_SEC(us); \
                                (tv)->tv_usec = USEC_T(us) % USEC_T(1000000); \
@@ -89,7 +89,7 @@ typedef void cbfn(const int, const short, void *);
 static pthread_once_t timeout_init_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t timeout_mutex;
 static pthread_key_t current_thread_key;
-static struct timeout_event_list pending, timeouts, freelist;
+static struct timeout_event_list pending, freelist;
 static unsigned freelist_len = 0;
 static timeout_event_t wakeup_timeout;
 static struct event_base *timeout_event_base = NULL;
@@ -143,6 +143,40 @@ dump_list(const char *name, struct timeout_event_list *list)
 }
 #endif
 
+static void
+mc_timeout_destroy(struct timeout_event_list *list, timeout_event_t *t)
+{
+    timeout_event_t **tp;
+    ANN(pthread_mutex_lock(&timeout_mutex));
+    LL_FOREACH(list,tp) {
+        if(*tp == t) {
+            LL_REMOVE(tp);
+            break;
+        }
+    }
+    if(event_initialized(&t->ev))
+        event_del(&t->ev);
+    mc_timeout_free_no_mutex(t);
+    ANN(pthread_mutex_unlock(&timeout_mutex));
+}
+
+static timeout_event_t*
+mc_timeout_find(struct timeout_event_list *list, int fd)
+{
+    timeout_event_t **tp,*t = NULL;
+
+    ANN(pthread_mutex_lock(&timeout_mutex));
+    if (!LL_EMPTY(list)) {
+        LL_FOREACH(list,tp)
+            if(*tp && (*tp)->fd == fd) {
+                t = *tp;
+                break;
+            }
+    }
+    ANN(pthread_mutex_unlock(&timeout_mutex));
+    return t;
+}
+
 static timeout_event_t*
 mc_timeout_add(conn *c, const struct timeval *tv, short flags,
                            struct timeout_event_list *list,
@@ -181,8 +215,6 @@ mc_timeout_add(conn *c, const struct timeval *tv, short flags,
             const char *list_name = "unknown";
             if(list == &pending)
                 list_name = "pending";
-            else if(list == &timeouts)
-                list_name = "timeouts";
             else if(list == &freelist)
                 list_name = "freelist";
             fprintf(stderr,"%d: added new timeout at %llu ms to %s list.\n",
@@ -209,7 +241,7 @@ void mc_timeout_check_idle(LIBEVENT_THREAD *me)
             /* Make sure we are still talking about the same connection and
              * that it has really timed out.
              */
-            if(t->c == conns[t->fd] && t->c->sfd == t->fd && CONN_CAN_TIMEOUT(t->c)) {
+            if(t->c->sfd == t->fd && CONN_CAN_TIMEOUT(t->c)) {
                 usec_t elapsed = now - SEC_TO_USEC(t->c->last_cmd_time);
                 if(elapsed >= TV_TO_USEC(&t->tv)) {
                     event_del(&t->ev);
@@ -230,13 +262,15 @@ void mc_timeout_check_idle(LIBEVENT_THREAD *me)
                     TIMEOUT_DESTROY_UNSAFE(tp);
                 }
             } else
-                /* a mismatch between connections or file descriptors
-                 * means the connection is different than when the timeout
-                 * was registered. Silently discard it.
+                /* a mismatch between file descriptors means the connection is
+                 * different than when the timeout was registered. Silently discard it.
                  */
                 TIMEOUT_DESTROY_UNSAFE(tp);
 
         } else
+            /* The connection no longer exists or there is a thread mismatch.
+             * ignore it.
+             */
             TIMEOUT_DESTROY_UNSAFE(tp);
     }
     ANN(pthread_mutex_unlock(&timeout_mutex));
@@ -256,7 +290,7 @@ timeout_close_handler(const int fd, const short flags, void *arg)
         fprintf(stderr, "timeout handler on thread running for fd %d\n", fd);
     AN(t);
     AN(t->c);
-    if(!me || THREAD_EQL(me,t->c->thread)) {
+    if(!me || !THREAD_EQL(me,t->c->thread)) {
         fprintf(stderr, "warning: not running in connection thread, "
                              "redirecting to timeout_event_handler\n");
         timeout_event_handler(fd,flags,arg);
@@ -264,11 +298,38 @@ timeout_close_handler(const int fd, const short flags, void *arg)
         mc_timeout_check_idle(me);
 }
 
+static inline
+int thr_find(LIBEVENT_THREAD *threads[], LIBEVENT_THREAD *td)
+{
+    int i;
+
+    for(i = 0; i < settings.num_threads; i++)
+        if(THREAD_EQL(threads[i],td))
+            break;
+
+    return (threads[i] != NULL ? i : -1);
+}
+
+static inline
+int thr_add(LIBEVENT_THREAD *threads[], LIBEVENT_THREAD *td)
+{
+    int i;
+
+    for(i = 0; i < settings.num_threads && threads[i] && !THREAD_EQL(threads[i],td); i++)
+        ;
+
+    if(i < settings.num_threads && !threads[i])
+        threads[i] = td;
+    else
+        i = -1;
+    return i;
+}
+
 /* NB: timeout_event_handler() runs in the timeout background thread */
-static void timeout_event_handler(const int fd, const short flags, void *arg)
+static
+void timeout_event_handler(const int fd, const short flags, void *arg)
 {
     timeout_event_t *t = (timeout_event_t*)arg;
-    timeout_event_t *cause = NULL;
     char buf[1] = {'T'};
     usec_t next_sleep = (usec_t)settings.timeout_thread_sleep;
     usec_t idle_timeout = SEC_TO_USEC(settings.idle_timeout);
@@ -276,97 +337,58 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
     struct timeval tv;
     usec_t elapsed;
     int i;
-    LIBEVENT_THREAD *wake_thread = NULL;
+    static LIBEVENT_THREAD **threads = NULL;
+    static int nthr = -1;
 
     AN(t);
+
+    if(nthr != settings.num_threads || !threads) {
+        nthr = settings.num_threads;
+        threads = calloc(nthr+1,sizeof(*threads));
+        if (threads == NULL) {
+            vperror("calloc while allocating memory for awakened threads in %s:%d",
+                     __FILE__,__LINE__);
+            event_add(&t->ev,&t->tv);
+            return;
+        }
+    } else for(i = 0; i < nthr; i++)
+        threads[i] = NULL;
+
     if (max_fds <= 0)
         max_fds = settings.maxconns;
 
-    ANN(pthread_mutex_lock(&timeout_mutex));
     if(settings.verbose > 1)
         fprintf(stderr,"\ntimeout_event_handler thread start, now = %llu\n",
                                         (unsigned long long)USEC_TO_SEC(now));
 
-    if(!LL_EMPTY(&timeouts)) {
-        timeout_event_t *ti, **tp;
-        /* scan the list of custom/old timeouts to move to pending or destroy */
-        LL_FOREACH_E(&timeouts,tp,ti) {
-            if(ti->fd == fd || fd == -1) {
-                if(cause == NULL && ti->fd > -1 && ti->fd < max_fds &&
-                                                conns[ti->fd] && ti->c) {
-                    elapsed = now - SEC_TO_USEC(ti->c->last_cmd_time);
-                    if (!CONN_CAN_TIMEOUT(ti->c) || ti->c != conns[ti->fd]) {
-                        ti->fd = -1;
-                        ti->c = NULL;
-                    } else if (elapsed >= TV_TO_USEC(&t->tv)) {
-                        cause = ti;
-                        event_del(&cause->ev);
-                        /* move the timeout to the pending list and wake up
-                         * the thread responsible.
-                         */
-                        wake_thread = cause->c->thread;
-                        AN(wake_thread && wake_thread->notify_send_fd > -1);
-                        if(write(wake_thread->notify_send_fd,buf,1) == 1) {
-                            LL_REMOVE(tp);
-                            USEC_TO_TV(&cause->tv,elapsed);
-                            LL_INSERT(&pending,cause);
-                        } else {
-                            wake_thread = NULL;
-                            perror("Failed writing timeout to notify pipe");
-                            TIMEOUT_DESTROY_UNSAFE(tp);
-                        }
-                        continue;
-                    }
-                } else {
-                    /* An old timeout has been fully handled (fd == -1) or
-                       the connection is invalid, either way discard it */
-                    ti->fd = -1;
-                    ti->c = NULL;
-                }
-            }
-            if(ti->fd == -1)
-                TIMEOUT_DESTROY_UNSAFE(tp);
-        }
-    }
-    if(settings.verbose > 2)
-        fprintf(stderr,"timeout_event_handler existing scan complete\n");
-    ANN(pthread_mutex_unlock(&timeout_mutex));
-
     /* Scan all connections to see if there are any candidates for timeout,
-     * if so, move them to pending and wake up the appropriate thread.
+     * if so, add a timeout to pending and wake up the appropriate thread.
      * We only wake up one thread per loop, although all candidates for that
      * thread will get moved in one pass.
      */
     for (i = 0; i < max_fds; i++) {
         conn *c = conns[i];
-        if(!c || !CONN_CAN_TIMEOUT(c) || !c->thread)
+        if(!c || !CONN_CAN_TIMEOUT(c) || !c->thread || c->last_cmd_time == 0)
             continue;
         if((elapsed = now - SEC_TO_USEC(c->last_cmd_time)) >= idle_timeout) {
-            if (!wake_thread || THREAD_EQL(wake_thread,c->thread)) {
-                USEC_TO_TV(&tv,elapsed);
-                t = mc_timeout_add(c,&tv,0,&pending,NULL,timeout_close_handler);
-                AN(t);
+            if (mc_timeout_find(&pending,c->sfd))
+                continue;
+            USEC_TO_TV(&tv,elapsed);
+            t = mc_timeout_add(c,&tv,0,&pending,NULL,timeout_close_handler);
+            AN(t);
+            if(thr_find(threads,c->thread) == -1) {
                 assert(c->thread->notify_send_fd > -1);
                 if (write(c->thread->notify_send_fd,buf,1) != 1) {
-                    timeout_event_t **tp;
                     perror("Failed writing timeout to notify pipe");
-                    USEC_TO_TV(&tv,settings.timeout_thread_sleep);
-                    AZ(pthread_mutex_lock(&timeout_mutex));
-                    LL_FINDP(&pending,tp,t);
-                    AN(tp);
-                    LL_INSERT(&timeouts,LL_REMOVE(tp));
-                    ANN(pthread_mutex_unlock(&timeout_mutex));
+                    mc_timeout_destroy(&pending,t);
                 } else
-                    wake_thread = c->thread;
-            } else if(wake_thread)
-                /* Another thread needs to be woken up, so schedule an
-                 * immediate re-run.
-                 */
-                 next_sleep = 0;
+                    thr_add(threads,c->thread);
+            }
         } else if(elapsed < idle_timeout && next_sleep > idle_timeout - elapsed)
             next_sleep = idle_timeout - elapsed;
     }
 
+    /* Cleanup freelist if its too large */
     if (freelist_len >= MAX_FREE_TIMEOUTS) {
         timeout_event_t **tp;
         ANN(pthread_mutex_lock(&timeout_mutex));
@@ -386,16 +408,14 @@ static void timeout_event_handler(const int fd, const short flags, void *arg)
         static int counter = 0;
 
         if(counter % 10 == 0) {
-            dump_list("timeouts",&timeouts);
             dump_list("pending",&pending);
             dump_list("freelist",&freelist);
         }
         counter++;
     }
 #endif
-
     USEC_TO_TV(&t->tv,next_sleep);
-    event_add(&t->ev,(next_sleep > 0 ? &t->tv : NULL));
+    event_add(&t->ev,&t->tv);
     if(settings.verbose > 2)
         fprintf(stderr,"timeout_event_handler thread run complete, sleeping for %llu ms\n\n",
                                             (unsigned long long)USEC_TO_MSEC(next_sleep));
@@ -410,7 +430,6 @@ timeout_thread(void *c)
 {
     AN(c);
     ANN(pthread_mutex_lock(&timeout_mutex));
-    LL_INIT(&timeouts);
     LL_INIT(&freelist);
     LL_INIT(&pending);
     AN(timeout_event_base = event_init());
@@ -491,13 +510,6 @@ void mc_timeout_clear(conn *c)
     LL_FOREACH(&pending,tp) {
         if((*tp)->c == c)
             TIMEOUT_DESTROY_UNSAFE(tp);
-    }
-    LL_FOREACH(&timeouts,tp) {
-        if((*tp)->c == c) {
-            /* the timeout thread will clear these up later */
-            (*tp)->fd = -1;
-            (*tp)->c = NULL;
-        }
     }
     ANN(pthread_mutex_unlock(&timeout_mutex));
 }
